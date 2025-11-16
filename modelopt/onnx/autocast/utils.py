@@ -24,6 +24,7 @@ support the core functionality of model precision conversion.
 import logging
 from collections import defaultdict
 
+import numpy as np
 import onnx
 
 from modelopt.onnx.utils import get_opset_version
@@ -178,3 +179,154 @@ def get_op_types_not_supported_in_low_precision(
         )
 
     return list(ops_without_support.keys())
+
+
+def load_shape_overrides_from_calibration_data(
+    calibration_data: str | dict | None,
+) -> dict[str, tuple]:
+    """Extract tensor shapes from calibration data.
+
+    Args:
+        calibration_data: Path to NPZ/JSON file, or dict with input tensors.
+
+    Returns:
+        dict: Mapping of tensor names to their shapes.
+    """
+    if calibration_data is None:
+        return {}
+
+    shape_overrides = {}
+
+    try:
+        if isinstance(calibration_data, str):
+            if calibration_data.endswith(".npz"):
+                data = np.load(calibration_data)
+                shape_overrides = {name: data[name].shape for name in data.files}
+            elif calibration_data.endswith(".json"):
+                from polygraphy.json import load_json
+
+                data_list = load_json(calibration_data, description="input data")
+                if data_list and len(data_list) > 0:
+                    first_sample = data_list[0]
+                    shape_overrides = {name: tensor.shape for name, tensor in first_sample.items()}
+            else:
+                logging.warning(
+                    f"Unknown calibration data format: {calibration_data}. Using default shapes."
+                )
+        elif isinstance(calibration_data, dict):
+            shape_overrides = {name: tensor.shape for name, tensor in calibration_data.items()}
+    except Exception as e:
+        logging.warning(f"Failed to load shapes from calibration data: {e}. Using default shapes.")
+
+    return shape_overrides
+
+
+def estimate_model_memory_requirements(
+    model: onnx.ModelProto, shape_overrides: dict[str, tuple] | None = None
+) -> int:
+    """Estimate the memory required to run inference on the model.
+
+    This estimates memory by summing:
+    - All initializers (weights, biases, constants)
+    - All intermediate tensors (value_info)
+    - Model inputs and outputs
+
+    Args:
+        model: ONNX model to estimate memory for.
+        shape_overrides: Optional dict mapping tensor names to their shapes.
+                        Used to resolve dynamic dimensions. If not provided,
+                        dynamic dimensions default to 1.
+
+    Returns:
+        int: Estimated memory requirement in bytes.
+
+    Note:
+        This is a conservative estimate and doesn't account for:
+        - ONNX Runtime internal overhead
+        - Temporary buffers during operator execution
+        - Memory fragmentation
+        - Peak memory usage during specific operations
+    """
+    total_bytes = 0
+    shape_overrides = shape_overrides or {}
+
+    # Helper function to get tensor size in bytes
+    def get_tensor_size_bytes(tensor_type, tensor_name: str = "") -> int:
+        """Calculate tensor size in bytes from ONNX tensor type."""
+        if not tensor_type.HasField("tensor_type"):
+            return 0
+
+        elem_type = tensor_type.tensor_type.elem_type
+        shape = tensor_type.tensor_type.shape
+
+        # Check if we have a shape override from calibration data
+        if tensor_name in shape_overrides:
+            num_elements = int(np.prod(shape_overrides[tensor_name]))
+        else:
+            # Get number of elements from the model's shape info
+            num_elements = 1
+            has_dynamic_dim = False
+            for dim in shape.dim:
+                if dim.HasField("dim_value"):
+                    num_elements *= dim.dim_value
+                elif dim.HasField("dim_param") or not dim.WhichOneof("value"):
+                    # Dynamic dimension - default to 1
+                    num_elements *= 1
+                    has_dynamic_dim = True
+
+            if has_dynamic_dim and tensor_name:
+                logging.warning(
+                    f"Tensor '{tensor_name}' has dynamic dimensions, but calibration data was not provided."
+                    f"Using size 1 for unknowns. Computed memory requirements may be underestimated."
+                )
+
+        # Get byte size from ONNX type using built-in helper
+        try:
+            dtype = onnx.helper.tensor_dtype_to_np_dtype(elem_type)
+            bytes_per_element = dtype.itemsize
+        except (ValueError, KeyError, TypeError):  # Fallback for unsupported types
+            bytes_per_element = 1  # default to 1 byte (undefined type)
+
+        return num_elements * bytes_per_element
+
+    # Sum initializers
+    for init in model.graph.initializer:
+        num_elements = int(np.prod(init.dims)) if init.dims else 1
+        try:
+            dtype = onnx.helper.tensor_dtype_to_np_dtype(init.data_type)
+            total_bytes += num_elements * dtype.itemsize
+        except (ValueError, KeyError, TypeError):  # Fallback for unsupported types
+            total_bytes += num_elements * 1
+
+    # Sum intermediate tensors (value_info)
+    for vi in model.graph.value_info:
+        total_bytes += get_tensor_size_bytes(vi.type, vi.name)
+
+    # Sum inputs
+    for input_info in model.graph.input:
+        # Skip initializers (they're counted above)
+        if any(init.name == input_info.name for init in model.graph.initializer):
+            continue
+        total_bytes += get_tensor_size_bytes(input_info.type, input_info.name)
+
+    # Sum outputs
+    for output_info in model.graph.output:
+        total_bytes += get_tensor_size_bytes(output_info.type, output_info.name)
+
+    return total_bytes
+
+
+def format_bytes(bytes_value: int) -> str:
+    """Format bytes into human-readable string.
+
+    Args:
+        bytes_value: Number of bytes.
+
+    Returns:
+        str: Human-readable string (e.g., "1.5 GB").
+    """
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} PB"

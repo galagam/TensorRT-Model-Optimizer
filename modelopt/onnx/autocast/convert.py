@@ -25,6 +25,7 @@ nodes.
 
 import numpy as np
 import onnx
+import psutil
 
 import modelopt.onnx.autocast.utils as utils
 import modelopt.onnx.utils as onnx_utils
@@ -169,6 +170,32 @@ def convert_to_mixed_precision(
     # Obtain reference data
     ref_outputs_dict = None
     if (data_max is not None and data_max != np.inf) or graph_sanitizer.custom_ops:
+        # Check memory availability before running inference
+        # Extract shapes from calibration data to better estimate memory for dynamic shapes
+        shape_overrides = utils.load_shape_overrides_from_calibration_data(calibration_data)
+        estimated_memory = utils.estimate_model_memory_requirements(model, shape_overrides)
+        available_mem = psutil.virtual_memory().available
+
+        if available_mem < estimated_memory:
+            raise MemoryError(
+                f"Insufficient memory for ReferenceRunner inference. "
+                f"Available: {utils.format_bytes(available_mem)}, "
+                f"Estimated: {utils.format_bytes(estimated_memory)}. "
+                f"Consider reducing batch size in calibration data or running on a system with more memory."
+            )
+        elif available_mem < estimated_memory * 2.0:
+            logger.warning(
+                f"Low memory available for ReferenceRunner inference. "
+                f"Available: {utils.format_bytes(available_mem)}, "
+                f"Estimated: {utils.format_bytes(estimated_memory)}. "
+                f"This may still succeed, but monitor for out-of-memory errors."
+            )
+
+        logger.info(
+            f"Memory check passed. Available: {utils.format_bytes(available_mem)}, "
+            f"Estimated: {utils.format_bytes(estimated_memory)}"
+        )
+
         ref_runner = ReferenceRunner(model, providers, trt_plugins)
         ref_outputs_dict = ref_runner.run(calibration_data)
 
